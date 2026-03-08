@@ -29,6 +29,7 @@ ENV/
 
 # IDEs
 .idea/
+.idea
 .vscode/
 
 # Project specific
