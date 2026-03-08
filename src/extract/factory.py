@@ -1,11 +1,9 @@
-import os
 import zipfile
 import tempfile
-import json
 from pathlib import Path
 
-from inp_parser import InpParser
-from net_parser import NetParser
+from .inp_parser import InpParser
+from .net_parser import NetParser
 
 
 class ParserFactory:

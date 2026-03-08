@@ -1,7 +1,8 @@
 import tkinter as tk
 import traceback
-from typing import Dict, List, Tuple, Optional
-from parser_factory import ParserFactory
+from typing import Dict, List, Tuple
+
+from src.extract.factory import ParserFactory
 
 
 class NetworkViewer:

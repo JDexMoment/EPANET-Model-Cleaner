@@ -4,10 +4,10 @@ from pathlib import Path
 from typing import Dict
 import os
 
-from parser_factory import ParserFactory
-from cleaner import InpCleaner
-from writer import ModelWriter
-from viewer import NetworkViewer
+from src.extract.factory import ParserFactory
+from src.transform.cleaner import InpCleaner
+from src.load.writer import ModelWriter
+from src.ui.viewer import NetworkViewer
 
 
 class AppGUI:
