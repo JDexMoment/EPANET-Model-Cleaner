@@ -1,30 +1,69 @@
 """
 SimulationRunner — запуск гидравлической симуляции через WNTR.
 
-Отвечает исключительно за вычисления; UI-логика сюда не попадает.
-
 Алгоритм
 --------
-1. Загрузить WaterNetworkModel из INP-файла (wntr).
-2. Запустить EpanetSimulator.run_sim().
-3. Упаковать результаты в SimulationResults и вернуть.
-
-Все статусные сообщения передаются через callback-функцию `progress_cb`,
-которую GUI подключает к своей строке состояния / прогресс-бару.
+1. Прочитать файл любого формата через ParserFactory.create().
+2. Отфильтровать секции — оставить только те, что понимает WNTR.
+3. Почистить [OPTIONS] от ключей с нечисловыми значениями.
+4. Записать чистый INP через ModelWriter во временный файл.
+5. Загрузить WaterNetworkModel из подготовленного INP.
+6. Запустить EpanetSimulator.run_sim().
+7. Упаковать результаты в SimulationResults и вернуть.
 """
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
-import zipfile
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .results import SimulationResults
 
-
-# Тип колбэка: принимает строку сообщения и значение прогресса 0..100
 ProgressCallback = Callable[[str, int], None]
+
+
+# ── Белый список секций, которые WNTR умеет читать ────────────────────────────
+# Всё, чего нет в этом списке (PRESS, LABELS, TAGS, BACKDROP и др.),
+# будет отброшено до передачи в WNTR.
+WNTR_KNOWN_SECTIONS = {
+    '[TITLE]',
+    '[JUNCTIONS]',
+    '[RESERVOIRS]',
+    '[TANKS]',
+    '[PIPES]',
+    '[PUMPS]',
+    '[VALVES]',
+    '[TAGS]',           # WNTR читает, но не использует — безопасно оставить
+    '[DEMANDS]',
+    '[STATUS]',
+    '[PATTERNS]',
+    '[CURVES]',
+    '[CONTROLS]',
+    '[RULES]',
+    '[ENERGY]',
+    '[EMITTERS]',
+    '[QUALITY]',
+    '[SOURCES]',
+    '[REACTIONS]',
+    '[MIXING]',
+    '[TIMES]',
+    '[REPORT]',         # WNTR читает секцию [REPORT] (не ключ REPORT в OPTIONS)
+    '[OPTIONS]',        # ОБЯЗАТЕЛЬНА — содержит единицы измерения
+    '[COORDINATES]',
+    '[VERTICES]',
+    '[LABELS]',         # WNTR читает, но не использует — безопасно
+    '[BACKDROP]',       # WNTR игнорирует, но не падает
+    '[END]',
+}
+
+# Ключи в [OPTIONS], значения которых WNTR пытается привести к float,
+# но там стоят строки ('No', 'Continue', 'Stop') → ValueError
+PROBLEMATIC_OPTION_KEYS = {
+    'unbalanced',   # UNBALANCED Continue 10 / No / Stop
+    'map',          # MAP <filename.map>
+}
 
 
 class SimulationRunner:
@@ -37,7 +76,6 @@ class SimulationRunner:
         Путь к файлу гидравлической модели.
     progress_cb : ProgressCallback | None
         Опциональный колбэк вида (message: str, percent: int) -> None.
-        GUI может подключить его к прогресс-бару и текстовому полю.
     """
 
     def __init__(
@@ -47,41 +85,32 @@ class SimulationRunner:
     ):
         self.filepath = Path(filepath)
         self._cb = progress_cb or (lambda msg, pct: None)
-        self._tmp_inp: Optional[str] = None   # временный INP, если нужен
+        self._tmp_dir: Optional[str] = None
 
     # ── Публичный метод ───────────────────────────────────────────────────────
 
     def run(self) -> SimulationResults:
         """
-        Выполняет полный цикл: загрузка → расчёт → упаковка результатов.
-
-        Returns
-        -------
-        SimulationResults
-
-        Raises
-        ------
-        ImportError  — если пакет wntr не установлен.
-        RuntimeError — если симуляция завершилась с ошибкой.
+        Полный цикл: чтение → фильтрация → запись → расчёт → результаты.
         """
         try:
-            import wntr  # noqa: F401 — проверяем наличие библиотеки
+            import wntr  # noqa
         except ImportError as exc:
             raise ImportError(
                 "Библиотека 'wntr' не установлена.\n"
                 "Установите её командой:  pip install wntr"
             ) from exc
 
-        self._cb("Подготовка файла модели…", 5)
-        inp_path = self._resolve_inp_path()
+        self._cb("Чтение файла модели…", 5)
+        inp_path = self._extract_to_clean_inp()
 
-        self._cb("Загрузка гидравлической модели…", 20)
+        self._cb("Загрузка гидравлической модели в WNTR…", 30)
         wn = self._load_model(inp_path)
 
-        self._cb("Запуск гидравлического расчёта (EPANET)…", 40)
+        self._cb("Запуск гидравлического расчёта (EPANET)…", 50)
         raw = self._simulate(wn)
 
-        self._cb("Обработка результатов…", 80)
+        self._cb("Обработка результатов…", 85)
         results = self._pack_results(raw, wn, str(self.filepath))
 
         self._cb("Готово!", 100)
@@ -90,63 +119,129 @@ class SimulationRunner:
 
     # ── Внутренние методы ─────────────────────────────────────────────────────
 
-    def _resolve_inp_path(self) -> str:
+    def _extract_to_clean_inp(self) -> str:
         """
-        Если файл — ZIP-архив (.epanet), извлечь INP во временную папку.
-        Возвращает путь к готовому INP-файлу.
+        Главный метод подготовки файла:
+
+        1. Читает файл любого формата через ParserFactory (INP/NET/EPANET/ZIP).
+        2. Фильтрует секции — оставляет только те, что в WNTR_KNOWN_SECTIONS.
+           Это убирает [PRESS], [VERTICES_EXTRA] и любые другие нестандартные
+           секции, вызывающие ENSyntaxError 201.
+        3. Очищает [OPTIONS] от ключей с нечисловыми значениями
+           (UNBALANCED, MAP), вызывающих ValueError в WNTR.
+        4. Записывает результат через ModelWriter во временный INP.
         """
-        path = self.filepath
-        if not path.exists():
-            raise FileNotFoundError(f"Файл не найден: {path}")
-
-        # .epanet / .zip-архив
-        if zipfile.is_zipfile(str(path)):
-            with zipfile.ZipFile(str(path), "r") as z:
-                inp_files = [f for f in z.namelist() if f.lower().endswith(".inp")]
-                if not inp_files:
-                    raise ValueError("Внутри архива .epanet не найден .inp файл.")
-                tmp_dir = tempfile.mkdtemp(prefix="epanet_sim_")
-                extracted = z.extract(inp_files[0], tmp_dir)
-                self._tmp_inp = extracted
-                return extracted
-
-        # .net — бинарный формат Delphi; нужно сначала сконвертировать
-        if path.suffix.lower() == ".net":
-            return self._convert_net_to_inp(str(path))
-
-        # .inp — возвращаем как есть
-        return str(path)
-
-    def _convert_net_to_inp(self, net_path: str) -> str:
-        """
-        Конвертирует бинарный .NET во временный .INP через уже
-        существующие парсеры проекта (NetParser → ModelWriter).
-        """
-        from src.extract.net_parser import NetParser
+        from src.extract.factory import ParserFactory
         from src.load.writer import ModelWriter
 
-        self._cb("Конвертация .NET → .INP…", 12)
-        parser = NetParser(net_path)
-        sections, order = parser.read()
-        preamble = parser.get_preamble()
+        if not self.filepath.exists():
+            raise FileNotFoundError(f"Файл не найден: {self.filepath}")
 
-        tmp_dir = tempfile.mkdtemp(prefix="epanet_sim_")
-        tmp_inp = os.path.join(tmp_dir, "model.inp")
-        writer = ModelWriter(tmp_inp)
-        writer.write(sections, order, preamble)
-        self._tmp_inp = tmp_inp
+        # ── Шаг 1: читаем файл через фабрику ──────────────────────────────
+        self._cb("Парсинг файла модели…", 8)
+        try:
+            parser = ParserFactory.create(str(self.filepath))
+            sections, order = parser.read()
+            preamble = parser.get_preamble()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Не удалось прочитать файл '{self.filepath.name}':\n{exc}"
+            ) from exc
+
+        # ── Шаг 2: фильтруем секции по белому списку ──────────────────────
+        # Убираем всё нестандартное ([PRESS], [BACKDROP] нестандартный и т.д.)
+        filtered_sections: Dict[str, List[str]] = {}
+        filtered_order: List[str] = []
+
+        skipped = []
+        for sec_name in order:
+            if sec_name in WNTR_KNOWN_SECTIONS:
+                filtered_sections[sec_name] = sections[sec_name]
+                filtered_order.append(sec_name)
+            else:
+                skipped.append(sec_name)
+
+        if skipped:
+            self._cb(
+                f"Пропущены нестандартные секции: {', '.join(skipped)}", 12
+            )
+
+        # ── Шаг 3: чистим [OPTIONS] от проблемных ключей ──────────────────
+        if '[OPTIONS]' in filtered_sections:
+            filtered_sections['[OPTIONS]'] = self._filter_options(
+                filtered_sections['[OPTIONS]']
+            )
+
+        # ── Шаг 4: записываем чистый INP во временную папку ───────────────
+        self._tmp_dir = tempfile.mkdtemp(prefix='epanet_sim_')
+        tmp_inp = os.path.join(self._tmp_dir, 'model_clean.inp')
+
+        self._cb("Запись подготовленного INP-файла…", 18)
+        try:
+            writer = ModelWriter(tmp_inp)
+            writer.write(filtered_sections, filtered_order, preamble)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ошибка записи временного INP-файла:\n{exc}"
+            ) from exc
+
         return tmp_inp
 
+    def _filter_options(self, lines: List[str]) -> List[str]:
+        """
+        Фильтрует строки секции [OPTIONS]:
+        убирает ключи, чьи значения WNTR не может привести к float.
+
+        Безопасные строковые значения, которые WNTR обрабатывает сам
+        (UNITS, QUALITY, HEADLOSS, HYDRAULICS и др.) — не трогаем.
+        """
+        result = []
+        for line in lines:
+            stripped = line.strip()
+
+            # Пустые строки и комментарии — оставляем
+            if not stripped or stripped.startswith(';'):
+                result.append(line)
+                continue
+
+            # Убираем inline-комментарий для анализа ключа
+            code = stripped.split(';')[0].strip()
+            parts = code.split()
+
+            if len(parts) >= 2:
+                key = parts[0].lower()
+                value = parts[1]
+
+                if key in PROBLEMATIC_OPTION_KEYS:
+                    try:
+                        float(value)
+                        # Значение числовое — WNTR справится, оставляем
+                        result.append(line)
+                    except ValueError:
+                        # Значение строковое — WNTR упадёт, пропускаем
+                        # Логируем для отладки
+                        result.append(f'; [SIM_SKIP] {line}')
+                        continue
+                else:
+                    result.append(line)
+            else:
+                result.append(line)
+
+        return result
+
     def _load_model(self, inp_path: str):
-        """Загружает WaterNetworkModel из INP-файла."""
+        """
+        Загружает WaterNetworkModel из уже подготовленного INP-файла.
+        К этому моменту файл уже чистый — дополнительный препроцессинг не нужен.
+        """
         import wntr
         try:
             wn = wntr.network.WaterNetworkModel(inp_path)
+            return wn
         except Exception as exc:
             raise RuntimeError(f"Ошибка загрузки модели:\n{exc}") from exc
-        return wn
 
-    def _simulate(self, wn):
+    def _simulate(self, wn) -> object:
         """Запускает EpanetSimulator и возвращает сырые результаты."""
         import wntr
         try:
@@ -160,16 +255,13 @@ class SimulationRunner:
         """
         Упаковывает сырые результаты WNTR в SimulationResults.
 
-        Параметры узлов  : pressure, head, demand, quality
-        Параметры звеньев: flowrate, velocity, status, headloss
+        Узловые параметры : pressure, head, demand, quality
+        Линейные параметры: flowrate, velocity, status, headloss
         """
-        import wntr  # noqa
+        node_results: Dict = {}
+        link_results: Dict = {}
 
-        node_results = {}
-        link_results = {}
-
-        # ── Узловые параметры ─────────────────────────────────────────────
-        for param in ("pressure", "head", "demand", "quality"):
+        for param in ('pressure', 'head', 'demand', 'quality'):
             try:
                 df = raw.node[param]
                 if df is not None and not df.empty:
@@ -177,8 +269,7 @@ class SimulationRunner:
             except (KeyError, AttributeError):
                 pass
 
-        # ── Линейные параметры ────────────────────────────────────────────
-        for param in ("flowrate", "velocity", "status", "headloss"):
+        for param in ('flowrate', 'velocity', 'status', 'headloss'):
             try:
                 df = raw.link[param]
                 if df is not None and not df.empty:
@@ -186,38 +277,26 @@ class SimulationRunner:
             except (KeyError, AttributeError):
                 pass
 
-        # ── Метаданные ────────────────────────────────────────────────────
         time_steps: List[float] = []
         if node_results:
-            first_df = next(iter(node_results.values()))
-            time_steps = list(first_df.index.astype(float))
+            time_steps = list(next(iter(node_results.values())).index.astype(float))
         elif link_results:
-            first_df = next(iter(link_results.values()))
-            time_steps = list(first_df.index.astype(float))
+            time_steps = list(next(iter(link_results.values())).index.astype(float))
 
         duration_h = max(time_steps) / 3600.0 if time_steps else 0.0
-
-        node_names = list(wn.node_name_list)
-        link_names = list(wn.link_name_list)
 
         return SimulationResults(
             node_results=node_results,
             link_results=link_results,
-            node_names=node_names,
-            link_names=link_names,
+            node_names=list(wn.node_name_list),
+            link_names=list(wn.link_name_list),
             time_steps=time_steps,
             duration_h=duration_h,
             filepath=original_path,
         )
 
     def _cleanup(self):
-        """Удаляет временные файлы после расчёта."""
-        if self._tmp_inp and os.path.exists(self._tmp_inp):
-            try:
-                os.remove(self._tmp_inp)
-                tmp_dir = os.path.dirname(self._tmp_inp)
-                if os.path.isdir(tmp_dir) and not os.listdir(tmp_dir):
-                    os.rmdir(tmp_dir)
-            except OSError:
-                pass
-            self._tmp_inp = None
+        """Удаляет временную директорию со всеми файлами после расчёта."""
+        if self._tmp_dir and os.path.isdir(self._tmp_dir):
+            shutil.rmtree(self._tmp_dir, ignore_errors=True)
+            self._tmp_dir = None
